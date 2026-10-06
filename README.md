@@ -60,7 +60,7 @@ docker compose up --build -d
 
 SQLite 数据库保存在命名卷 `uncertainty-data`（容器内 `/data/uncertainty.db`），容器重建后数据仍在。
 
-全部接口随该命令一同启动（含只读的测量精度反求接口 `POST /api/v1/precision-budgets`，无需额外配置）；反求接口的调用示例见 [第 9 节](#9-测量精度反求precision-budgets)。名义点紧贴定义域边界的模型（如 `y = 1 + asin(x)` 在 x = 1−5e-9 处，首个梯度探针即越过 x ≤ 1）也可直接反求与传播，见 [9.8 节](#98-右定义域边界asin-在-x1首个对称探针越界时收缩步长闭区间-1e-9)。
+全部接口随该命令一同启动（含只读的测量精度反求接口 `POST /api/v1/precision-budgets`，无需额外配置）；反求接口的调用示例见 [第 9 节](#9-测量精度反求precision-budgets)。名义点紧贴定义域边界的模型（如 `y = 1 + asin(x)` 在 x = 1−5e-9 处，首个梯度探针即越过 x ≤ 1）也可直接反求与传播，见 [9.8 节](#98-右定义域边界asin-在-x1首个对称探针越界时收缩步长闭区间-1e-9)；名义点恰在**奇异端点**（一阶导数发散，如 `asin(1)`、`sqrt(0)`）的模型则按 422 拒绝一阶传播与反求，见 [9.9 节](#99-奇异端点发散导数不误作有限灵敏度拒绝一阶传播与反求)。
 
 停止：
 
@@ -257,6 +257,7 @@ curl -sS http://localhost:8000/api/v1/idempotency/demo-power-0001
 | N 越界（<1000 或 >100000） | 422 | Pydantic 校验错误 |
 | 蒙特卡洛不收敛 | 422 | `ConvergenceError: 蒙特卡洛 N=1000 未通过收敛判据 ...` |
 | 抽样越过模型定义域（如对正态量取 sqrt/log 产生 NaN） | 422 | `PropagationError: 蒙特卡洛抽样中模型产生了 k/N 个非有限结果 ...` |
+| 名义点恰在奇异端点（`asin(1)`、`sqrt(0)` 等一阶导数发散点） | 422 | `PropagationError: 模型在名义点处的一阶导数发散 ...`（见 [9.9](#99-奇异端点发散导数不误作有限灵敏度拒绝一阶传播与反求)） |
 | 幂等键绑定到不同请求 / 模型版本重复 | 409 | `ConflictError` |
 | 精度反求：未知模型版本 | 404 | `NotFoundError: 模型版本 ... 不存在`（见 [9.4](#94-拒绝场景)） |
 | 精度反求：未知输入名 / 目标量纲不符 / 目标负值或非有限 | 422 | `RequestError` / Pydantic 校验错误（见 [9.4](#94-拒绝场景)） |
@@ -960,7 +961,7 @@ curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
 1. 名义点 `f(x0)` 本身先求值；非有限（如 x0 = 1.0001）仍按原语义 422 拒绝，绝不放行。
 2. 首个对称探针越界时，**不**改用大步单侧差分——单侧一阶差分的 O(h) 截断在 `x→1⁻` 的高曲率处误差可达数倍（本例大步单侧误差接近 −200%）；而是把对称步长按 1/2 逐次收缩，直到 `x0±h` 都落在有效域内（h 一旦小于名义点到边界的距离即成立），继续使用域内**对称中心差分**（O(h²) 截断）。
 3. 收缩后的步长（≈2.96e-9）上再减半复核一次：减半后仍可辨则采用更小步长（截断随 h 单调减小），否则保留减半前估计。最终斜率 ≈ 1.0114e4，解析值 `1/sqrt(1−x0²) ≈ 1.0000e4`，相对误差 ~1.1%。
-4. 若收缩到浮点可分辨下限 `h_floor = eps·max(|x0|,1)` 仍有一侧出域（名义点恰在端点，如 `asin(1)`、`sqrt(0)`），才改用域内一侧取两个点的**小步二阶单侧差分**（消去 O(h) 主项）给斜率；真零方向（如 `0.0*sqrt(x)` 在 0）差值恒为 0，仍判零。
+4. 若收缩到浮点可分辨下限 `h_floor = eps·max(|x0|,1)` 仍有一侧出域（名义点恰在端点，如 `asin(1)`、`sqrt(0)`），才改用域内一侧取两个点的**小步二阶单侧差分**（消去 O(h) 主项），并对逐次减半的估计序列做**斜率收敛裁决**：发散端点（斜率 ~ h^(−1/2) 随减半持续增长）拒绝，有限单侧导数（如 `sqrt(x)*sqrt(x)` 在 0 处恒为 1）正常返回，真零方向（如 `0.0*sqrt(x)` 在 0）差值恒为 0 仍判零——裁决规则与示例见 [9.9 节](#99-奇异端点发散导数不误作有限灵敏度拒绝一阶传播与反求)。
 
 于是二次型 `v(u) = (g·u)² ≤ 1e-10` 正常求解：**ux ∈ [0, 9.88759e-10]**（闭区间，解析上界 t/g ≈ 1e-9），当前 ux = 1e-10 时 uc ≈ 1.01e-6 ≤ 1e-5，`satisfied=true`。
 
@@ -1073,7 +1074,126 @@ curl -sS -X POST http://localhost:8000/api/v1/evaluations \
 * 名义点在定义域外（如 x0 = 1.0001 提交 `asin` 模型）：反求与计算都仍返回 `422 PropagationError`（“非有限结果（NaN/Inf）”）；
 * 输入分布抽样越过定义域（如 x0 = 0.99、ux = 0.05 的正态抽样出现 x > 1）：蒙特卡洛仍以 `422` 拒绝并报告非有限样本数；
 * 真零斜率（如 `1 + x*x` 在 x = 0、`1 + 0.0*asin(x)` 在 1−5e-9）仍判零、返回无上限区间；内部点（如 `asin` 在 x = 0.5）的梯度路径与响应逐值不变；
+* 名义点**恰在**奇异端点（`asin(1)`、`sqrt(0)` 等一阶导数发散点）：一阶传播与反求都拒绝，见 [9.9 节](#99-奇异端点发散导数不误作有限灵敏度拒绝一阶传播与反求)；
 * 反求始终只读：不写计算记录、不修改登记的标准不确定度、可任意重复。
+
+#### 9.9 奇异端点：发散导数不误作有限灵敏度（拒绝一阶传播与反求）
+
+9.8 的名义点离边界还有 5e-9，收缩对称步长即可在域内取点；本节的模型名义点**恰好就是定义域端点**。无量纲模型 `y = 1 + asin(x)`，x = 1、ux = 1e-10：`asin` 在 x = 1 处的一阶导数 `1/sqrt(1−x²)` **发散**，GUM 一阶线性化在该点不适用。
+
+对称探针在浮点上无法取点（x0±h 总有一侧越界），梯度引擎转**固定步长二阶单侧差分**——但固定步长会把发散斜率截断成一个貌似有限的值：步长 `h_cap ≈ 6.06e-6` 处斜率估计 ≈ **743** 且“可辨”。若照收，反求会据此给出**虚假的有限预算**（v(u) = (743·u)² ≤ t² ⇒ 上界 ~1.3e-8），GUM 也复用同一伪梯度——这就是本节的修复对象。
+
+**裁决规则（单侧探针的缩步与斜率收敛）**：找到首个域内步长后不立即返回，而是继续减半取样，收集 4 个二阶单侧估计 g(h)、g(h/2)、g(h/4)、g(h/8)，在**舍入噪声接管之前**检查相邻估计的漂移量：
+
+* **有限导数**：截断误差随步长收缩（O(h^p)，p > 0），漂移量逐次减小——`sqrt(x)*sqrt(x)` 在 0 处估计恒为 1（漂移为 0）；O(h²) 型按 1/4 收缩；
+* **发散导数**（sqrt、asin/acos 端点，斜率 ~ h^(−1/2)）：漂移量随减半按 **√2 持续增长**（本例 g 序列 ≈ 743 → 1051 → 1486 → 2102，漂移 308 → 435 → 616）。三个漂移量严格递增、且最大漂移量超过末步估计舍入尺度（`eps·max|f|/(2h)`）的 16 倍时，判定导数发散，抛 `PropagationError`——反求与 GUM 传播共用同一梯度路径，一并 422。纯舍入噪声造成的漂移只在舍入尺度的几倍以内（噪声倍数门槛保证有限导数绝不会被误判），而可辨条件下的 h^(−1/2) 发散族漂移恒为该尺度的 75 倍以上，分隔干净。
+
+**登记（名义点 x = 1 本身有效，模型正常在册）：**
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/models \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "asin-endpoint-v1",
+    "name": "asin 奇异端点模型 y=1+asin(x)",
+    "expression": "1 + asin(x)",
+    "inputs": [
+      {"name": "x", "value": 1.0, "unit": "dimensionless",
+       "standard_uncertainty": 1e-10, "distribution": "normal"}
+    ],
+    "output_unit": "dimensionless"
+  }'
+# HTTP 201（登记只校验表达式/单位/相关矩阵；发散裁决发生在梯度求值时）
+```
+
+**反求（拒绝，不再给出虚假的有限预算）：**
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "asin-endpoint-v1",
+    "input_name": "x",
+    "target": {"standard_uncertainty": 1e-5, "unit": "dimensionless"}
+  }'
+```
+
+返回 `422`（**实际响应**）：
+
+```json
+{
+  "error": "PropagationError",
+  "message": "模型在名义点处的一阶导数发散（定义域端点斜率随步长收缩持续增大，GUM 一阶线性化不适用），无法传播不确定度",
+  "status_code": 422
+}
+```
+
+**一阶传播同样拒绝，且不留任何部分结果**（GUM 复用同一梯度路径，在蒙特卡洛之前即失败；幂等键不被占用、计算记录数不变）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/evaluations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "asin-endpoint-v1",
+    "inputs": [
+      {"name": "x", "value": 1.0, "unit": "dimensionless",
+       "standard_uncertainty": 1e-10, "distribution": "normal"}
+    ],
+    "correlations": [],
+    "n": 2000, "seed": 7, "idempotency_key": "asin-endpoint-eval-0001"
+  }'
+# HTTP 422（同样的 PropagationError）
+
+curl -sS http://localhost:8000/api/v1/idempotency/asin-endpoint-eval-0001
+# HTTP 404：{"error": "NotFoundError", "message": "幂等键 'asin-endpoint-eval-0001' 没有对应的计算结果", ...}
+curl -sS "http://localhost:8000/api/v1/evaluations?model_version=asin-endpoint-v1"
+# {"items": [], "limit": 100, "offset": 0, "count": 0}
+```
+
+**`sqrt(x)` 在 x = 0 同理拒绝**（一阶导数 `1/(2√x)` 发散）：登记 `sqrt-endpoint-v1`（表达式 `sqrt(x)`、x = 0、ux = 1e-10）返回 201，反求返回与上面相同的 `422 PropagationError`。
+
+**仍然可以计算的情形**（裁决只拒绝发散导数，不误伤有效点）：
+
+* **有效内点** `x = 1−5e-9`（`asin` 模型）：收缩对称步长后域内中心差分正常估计（斜率 ≈ 1.01e4），反求与传播照常——见 [9.8 节](#98-右定义域边界asin-在-x1首个对称探针越界时收缩步长闭区间-1e-9)，响应逐值不变；
+* **有限单侧导数** `sqrt(x)*sqrt(x)` 在 0（即 x，x ≥ 0，单侧导数恒为 1）：估计序列收敛（漂移为 0），裁决放行。登记 `sqrtsqrt-endpoint-v1`（表达式 `sqrt(x)*sqrt(x)`、x = 0、ux = 1e-10）后：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "sqrtsqrt-endpoint-v1",
+    "input_name": "x",
+    "target": {"standard_uncertainty": 1e-5, "unit": "dimensionless"}
+  }'
+```
+
+返回 `200`（**实际响应**）：灵敏度恰为 1，可行区间是闭区间 **[0, 1e-5]**（v(u) = u² ≤ 1e-10），当前 ux = 1e-10 达标：
+
+```json
+{
+  "model_version": "sqrtsqrt-endpoint-v1",
+  "input_name": "x",
+  "input_unit": "dimensionless",
+  "target": {"standard_uncertainty": 1e-05, "unit": "dimensionless"},
+  "target_in_output_unit": {"standard_uncertainty": 1e-05, "unit": "dimensionless"},
+  "sensitivity": {"coefficient": 1.0, "unit": "dimensionless/dimensionless"},
+  "current_standard_uncertainty": {"value": 1e-10, "unit": "dimensionless"},
+  "current_combined_standard_uncertainty": {"value": 1e-10, "unit": "dimensionless"},
+  "satisfied": true,
+  "interval": {
+    "feasible": true,
+    "lower": 0.0,
+    "lower_inclusive": true,
+    "upper": 1e-05,
+    "upper_inclusive": true,
+    "unbounded_upper": false
+  }
+}
+```
+
+* **真零方向**（`1.0 + 0.0*sqrt(x)` 在 0）：单侧差分恒为 0，仍判零、返回无上限区间（与既有行为一致）。
+
+> 注：`sqrt(x)*sqrt(x)` 在 0 的**反求**可算（只读梯度路径），但其 `POST /api/v1/evaluations` 仍会因零均值分布抽样到 x < 0 产生 NaN 而被蒙特卡洛按既有语义拒绝（422，不留部分结果）——抽样越界与奇异端点是两类独立的拒绝。
 
 ## 模型表达式白名单
 
@@ -1130,7 +1250,7 @@ pip install -r requirements.txt pytest httpx
 python -m pytest -q
 ```
 
-测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝（< -1e-8）/舍入修复（[-1e-8,0)，保单位对角）/奇异接受（r=±1 零特征值）、r=±1 的 GUM 解析解 |ua+r·ub| 与 MC 同/反向传播、完全抵消退化为确定值、**小量级（u=1e-9）真实 ~1e-18 方差不被固定绝对阈值钳零（r=+1→2e-9、r=−1 不等→1e-9、r=−1 相等→0）及其 HTTP 登记/计算/幂等/查询/非法矩阵拒绝不落库**、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口、**精度反求二次不等式（负相关 r=−1→ua∈[1,3] 双侧有界、相关输入零端点开、零灵敏度→上界 null 无上限、无法达标→空区间、目标零/单位换算/未知版本/未知输入/量纲不符/负值/NaN/Inf 拒绝、只读不改模型不写记录不影响幂等与传播）**、**小量级反求（毫米模型目标 1e-9→闭区间 [0,1e-9] mm 真实小正上界保留、1e-13 微小灵敏度不误判为零→[0,1e9] 有限上界、小量级负相关双端区间 [1e-9,3e-9]、小量级真零灵敏度仍无上限）**、**定义域边界反求（1+1e-10·sqrt(x) 在 x0=1e-8 处中心差分扩步被 x−h<0 截断→域内单侧探针确认真实斜率 5e-7→闭区间 [0,~0.19] 且当前值达标、同边界真零斜率 0.0*sqrt(x) 仍无上限、反求与 GUM 管线梯度一致、过紧目标→上界随目标收缩且不达标）**等（88 个用例）。
+测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝（< -1e-8）/舍入修复（[-1e-8,0)，保单位对角）/奇异接受（r=±1 零特征值）、r=±1 的 GUM 解析解 |ua+r·ub| 与 MC 同/反向传播、完全抵消退化为确定值、**小量级（u=1e-9）真实 ~1e-18 方差不被固定绝对阈值钳零（r=+1→2e-9、r=−1 不等→1e-9、r=−1 相等→0）及其 HTTP 登记/计算/幂等/查询/非法矩阵拒绝不落库**、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口、**精度反求二次不等式（负相关 r=−1→ua∈[1,3] 双侧有界、相关输入零端点开、零灵敏度→上界 null 无上限、无法达标→空区间、目标零/单位换算/未知版本/未知输入/量纲不符/负值/NaN/Inf 拒绝、只读不改模型不写记录不影响幂等与传播）**、**小量级反求（毫米模型目标 1e-9→闭区间 [0,1e-9] mm 真实小正上界保留、1e-13 微小灵敏度不误判为零→[0,1e9] 有限上界、小量级负相关双端区间 [1e-9,3e-9]、小量级真零灵敏度仍无上限）**、**定义域边界反求（1+1e-10·sqrt(x) 在 x0=1e-8 处中心差分扩步被 x−h<0 截断→域内单侧探针确认真实斜率 5e-7→闭区间 [0,~0.19] 且当前值达标、同边界真零斜率 0.0*sqrt(x) 仍无上限、反求与 GUM 管线梯度一致、过紧目标→上界随目标收缩且不达标）**、**奇异端点发散裁决（asin(±1)/acos(±1)/sqrt(0)/x**0.5 端点斜率随减半按 √2 持续增长→反求与 GUM 一阶传播均 422 且不留部分结果不占用幂等键、sqrt(x)*sqrt(x) 在 0 的有限单侧导数=1 放行→闭区间 [0,t]、真零方向仍判零、x=1−5e-9 有效内点不受影响）**等（99 个用例）。
 
 ## 项目结构
 

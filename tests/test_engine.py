@@ -416,22 +416,49 @@ def test_gradient_initial_probe_beyond_domain_shrinks_symmetric_step():
         pass
 
 
-def test_gradient_exact_endpoint_uses_small_step_onesided_estimate():
-    # 名义点恰在定义域端点（中心差分在浮点上无法取点）：小步二阶单侧差分
-    # 给有限、正（或对 acos 为负）的斜率，不再直接抛错；真零方向仍判零。
+def test_gradient_divergent_endpoint_slope_is_rejected():
+    # 名义点恰在定义域端点且一阶导数发散（sqrt/asin/acos 端点，斜率随
+    # 步长减半按 √2 持续增长 ~ h^(-1/2)）：固定步长的二阶单侧差分会把
+    # 发散斜率截断成貌似有限的值（如 asin(1) 在 h_cap 处给 ~743），
+    # 若照收，反求会给出虚假的有限预算、GUM 会复用同一伪梯度。
+    # 裁决规则：逐次减半的估计序列漂移量持续增大且显著超舍入尺度 =>
+    # 导数发散，抛 PropagationError（一阶传播与反求共用本路径，一并拒绝）。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+    from app.errors import PropagationError
+
+    for src, x0 in (
+        ("sqrt(x)", 0.0),
+        ("asin(x)", 1.0),
+        ("asin(x)", -1.0),
+        ("acos(x)", 1.0),
+        ("acos(x)", -1.0),
+        ("1 + asin(x)", 1.0),
+        ("x ** 0.5", 0.0),
+    ):
+        expr = compile_expression(src, ("x",))
+        try:
+            numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
+            assert False, f"{src} @ {x0} 的发散端点斜率必须拒绝"
+        except PropagationError:
+            pass
+
+
+def test_gradient_finite_onesided_endpoint_slope_is_computed():
+    # 端点处的**有限**单侧导数仍可计算：sqrt(x)*sqrt(x) 在 0 处即 x（x≥0），
+    # 单侧导数恒为 1——逐次减半的估计序列收敛（漂移为 0），不触发发散裁决。
     from app.expressions import compile_expression
     from app.engine import numerical_gradient_with_noise
 
-    for src, x0, positive in (
-        ("sqrt(x)", 0.0, True),
-        ("asin(x)", 1.0, True),
-        ("asin(x)", -1.0, True),
-        ("acos(x)", 1.0, False),
+    for src, g_true in (
+        ("sqrt(x)*sqrt(x)", 1.0),
+        ("1.0 + sqrt(x)*sqrt(x)", 1.0),
+        ("sin(sqrt(x)*sqrt(x))", 1.0),
+        ("exp(sqrt(x)*sqrt(x))", 1.0),
     ):
         expr = compile_expression(src, ("x",))
-        g, _, resolved = numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
-        assert math.isfinite(g[0]), (src, x0)
-        assert (float(g[0]) > 0.0) == positive, (src, x0, g[0])
+        g, _, resolved = numerical_gradient_with_noise(expr, {"x": 0.0}, ("x",))
+        assert abs(g[0] - g_true) < 1e-9, (src, g[0])
         assert bool(resolved[0]) is True
 
     # 端点处的真零斜率（0.0*sqrt(x) 在 x=0）：二阶单侧差分恒为 0、不可辨

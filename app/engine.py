@@ -299,6 +299,20 @@ _GRADIENT_STEP_SHRINK = 0.5
 #: 说明名义点本身已紧贴定义域端点（如 sqrt(0)、asin(1)），转单侧估计。
 _GRADIENT_STEP_FLOOR_FACTOR = 1.0
 
+#: 端点单侧斜率的收敛裁决探针数：在首个域内步长上继续减半取样，得到
+#: g(h)、g(h/2)、g(h/4)、g(h/8) 四个二阶单侧估计（三个相邻漂移量）。
+#: 有限导数的截断误差随步长收缩（O(h^p)，p>0：漂移量逐次减小，如
+#: sqrt(x)*sqrt(x) 在 0 处估计恒为 1）；发散导数（sqrt、asin/acos 端点，
+#: 斜率 ~ h^(-1/2)）的漂移量随减半按 √2 持续增长——三个漂移量即可裁决。
+_ONESIDED_CONVERGENCE_PROBES = 4
+
+#: 发散裁决的舍入噪声下限倍数：仅当最大漂移量同时超过末步估计舍入尺度
+#: （eps·max|f|/(2h)）的该倍数时才判发散。纯舍入噪声造成的漂移不超过
+#: 该尺度的几倍（有限导数收敛估计，如 1+sqrt(x)*sqrt(x) 在 0 处），而
+#: h^(-1/2) 发散族在可辨窗口内的漂移量恒为该尺度的 75 倍以上（可辨条件
+#: |f1-f0| > 100·eps·|f| 直接推出），两个量级之间有干净的分隔。
+_ONESIDED_DIVERGENCE_NOISE_FACTOR = 16.0
+
 #: 可辨后继续放大步长时，相邻梯度允许的单步相对漂移。线性模型的舍入
 #: 噪声随 h 增大而减小（漂移恒小）；而截断误差 O(h²) 每放大 8 倍步长
 #: 增长 64 倍（漂移巨大）——该因子介于两者之间，用于在高曲率零名义点
@@ -355,7 +369,11 @@ def numerical_gradient_with_noise(
     差分（截断误差仍为 O(h²)，且为域内两侧取点）。收缩到浮点可分辨
     下限 h_floor = eps·max(|x0|, 1)（再小 x0±h 已坍缩为 x0）仍有一侧
     越界，才判定名义点紧贴端点（如 sqrt(0)、asin(1)），转
-    :func:`_onesided_gradient_at_boundary` 用小步二阶单侧差分给斜率。
+    :func:`_onesided_gradient_at_boundary`：用小步二阶单侧差分估计斜率，
+    并对逐次减半的估计序列做**斜率收敛裁决**——发散端点（sqrt、asin
+    端点处斜率 ~ h^(-1/2) 随减半持续增长）抛 PropagationError 拒绝
+    （GUM 一阶线性化在斜率发散处不适用），有限单侧导数（如
+    sqrt(x)*sqrt(x) 在 0 处恒为 1）正常返回。
     收缩得到的对称步长若仍处于高曲率截断区，再减半一次：只要减半后
     仍可辨就采用更小的步长（截断随 h 单调减小），否则保留减半前步长。
     名义点本身 f(x0) 就非有限（NaN/Inf）依旧立即抛错——
@@ -498,7 +516,7 @@ def _onesided_gradient_at_boundary(
     x0: float,
     h_cap: float,
 ) -> tuple[float, float, float, float, bool]:
-    """名义点紧贴定义域端点时的小步**二阶**单侧斜率估计。
+    """名义点紧贴定义域端点时的小步**二阶**单侧斜率估计 + 斜率收敛裁决。
 
     对称探针收缩到浮点可分辨下限 h_floor 仍有一侧出域（如 sqrt(0) 的
     x−h<0、asin(1) 的 x+h>1），说明名义点本身就是端点：中心差分在浮点上
@@ -514,16 +532,41 @@ def _onesided_gradient_at_boundary(
     h 从 h_cap 起逐次减半直到 x0+s·h、x0+s·2h 都在域内（端点处 h 恒有
     域内空间，除非函数在域内紧邻处也无定义——此时名义点视为无效，抛错）。
 
-    返回 ``(g, h, f1, f2, resolved)``；可辨门槛与中心差分一致（域内单侧
-    变化量超过输出舍入尺度的 F 倍）。真零方向（如 0.0*sqrt(x) 在 0）
-    f0 == f1 == f2，g 恰为 0、不可辨。
+    **缩步与斜率收敛裁决（在舍入噪声接管之前区分有限导数与发散导数）。**
+    端点处的一阶导数可能根本不存在：sqrt(x) 在 0、asin(x)/acos(x) 在 ±1
+    的斜率按 h^(-1/2) 发散。固定步长的单侧差分会把这种发散斜率截断成
+    一个貌似有限的值（如 asin(1) 在 h_cap 处给 ~743），若照收，反求会
+    据此给出虚假的有限预算、GUM 会复用同一伪梯度。因此找到首个域内步长
+    后不立即返回，而是继续减半取样，收集
+    :data:`_ONESIDED_CONVERGENCE_PROBES` 个估计 g(h)、g(h/2)、g(h/4)、
+    g(h/8)，检查相邻估计的漂移量序列：
+
+    * **有限导数**：截断误差随步长收缩（O(h^p)，p>0），漂移量逐次减小
+      ——sqrt(x)*sqrt(x) 在 0 处估计恒为 1（漂移为 0），x^1.5 型按
+      2^(-1/2) 收缩，O(h²) 型按 1/4 收缩；
+    * **发散导数**（~ h^(-1/2)）：漂移量随减半按 √2 **持续增长**——
+      三个漂移量严格递增且最大漂移量超过末步估计舍入尺度
+      （eps·max|f|/(2h)）的 :data:`_ONESIDED_DIVERGENCE_NOISE_FACTOR`
+      倍时，判定导数发散，抛 :class:`PropagationError`（GUM 一阶线性化
+      在斜率发散处不适用；反求与 GUM 传播共用本路径，一并 422）。
+      噪声倍数门槛保证纯舍入噪声（有限导数收敛估计的漂移只在该尺度的
+      几倍以内）绝不会被误判为发散——可辨条件下的 h^(-1/2) 发散族漂移
+      恒为该尺度的 75 倍以上，分隔干净。
+
+    可辨估计不足 4 个（探针在收集齐前已落到舍入噪声之下）时无法裁决，
+    回退到历史行为（取已得估计）。返回 ``(g, h, f1, f2, resolved)``，
+    取**最小步长**的可辨估计（收敛方向截断误差最小）；可辨门槛与中心
+    差分一致（域内单侧变化量超过输出舍入尺度的 F 倍）。真零方向
+    （如 0.0*sqrt(x) 在 0）f0 == f1 == f2，g 恰为 0、不可辨。
     """
     with np.errstate(all="ignore"):
         f0 = _evaluate_scalar(compiled, x_base)
     h_floor = _EPS * max(abs(x0), 1.0)
     for sign in (1.0, -1.0):
+        # (step, g, noise, resolved, f1, f2)，按步长从大到小收集
+        estimates: list[tuple[float, float, float, bool, float, float]] = []
         step = h_cap
-        while step > h_floor:
+        while step > h_floor and len(estimates) < _ONESIDED_CONVERGENCE_PROBES:
             env1 = dict(x_base)
             env2 = dict(x_base)
             env1[name] = x0 + sign * step
@@ -533,14 +576,41 @@ def _onesided_gradient_at_boundary(
                     f1 = _evaluate_scalar(compiled, env1)
                     f2 = _evaluate_scalar(compiled, env2)
             except PropagationError:
+                if estimates:
+                    break  # 已取到域内估计；继续收缩反而出域（区间定义域不会发生，防御）
                 step *= _GRADIENT_STEP_SHRINK
                 continue
             g = sign * (-3.0 * f0 + 4.0 * f1 - f2) / (2.0 * step)
+            noise = _EPS * max(abs(f0), abs(f1), abs(f2)) / (2.0 * step)
             resolved = (
                 abs(f1 - f0) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(f0), abs(f1))
                 or abs(f2 - f1) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(f1), abs(f2))
             )
-            return g, step, f1, f2, resolved
+            estimates.append((step, g, noise, resolved, f1, f2))
+            step *= _GRADIENT_STEP_SHRINK
+        if not estimates:
+            continue  # 该方向在浮点可分辨尺度内无域内点：换另一方向
+
+        # 斜率收敛裁决：4 个可辨估计齐备时，漂移量持续增大且显著超出
+        # 舍入尺度 => 端点导数发散（如 sqrt/asin 端点的 h^(-1/2) 斜率），
+        # 拒绝给出虚假的有限梯度。可辨估计不足时无法与舍入噪声区分，
+        # 回退到历史行为（取已得估计，由可辨标记决定是否判零）。
+        if len(estimates) == _ONESIDED_CONVERGENCE_PROBES and all(e[3] for e in estimates):
+            gs = [e[1] for e in estimates]
+            drifts = [abs(gs[i + 1] - gs[i]) for i in range(len(gs) - 1)]
+            if (
+                drifts[-1] > drifts[-2] > drifts[-3]
+                and drifts[-1] > _ONESIDED_DIVERGENCE_NOISE_FACTOR * estimates[-1][2]
+            ):
+                raise PropagationError(
+                    "模型在名义点处的一阶导数发散（定义域端点斜率随步长收缩持续增大，"
+                    "GUM 一阶线性化不适用），无法传播不确定度"
+                )
+
+        # 收敛（或证据不足）：取最小步长的可辨估计；全部不可辨时取首个
+        # （最大步长）估计——与历史行为一致，由 resolved=False 触发零裁决。
+        chosen = next((e for e in reversed(estimates) if e[3]), estimates[0])
+        return chosen[1], chosen[0], chosen[4], chosen[5], chosen[3]
     raise PropagationError(
         "模型在名义点（或其邻域）产生了非有限结果（NaN/Inf），无法传播不确定度"
     )

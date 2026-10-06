@@ -729,6 +729,100 @@ def test_invalid_nominal_outside_domain_still_rejected(client):
 
 
 # ---------------------------------------------------------------------------
+# 奇异端点：发散导数不得误作有限灵敏度（一阶传播与反求都拒绝）
+# ---------------------------------------------------------------------------
+
+def _asin_endpoint_model(version: str):
+    # y = 1 + asin(x)，x0 = 1（恰为定义域端点）：一阶导数 1/sqrt(1-x²) 发散。
+    return {
+        "version": version,
+        "expression": "1 + asin(x)",
+        "inputs": [
+            {"name": "x", "value": 1.0, "unit": "dimensionless",
+             "standard_uncertainty": 1e-10, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+
+
+def test_singular_endpoint_budget_rejected_no_false_finite_budget(client):
+    # 回归：固定步长二阶单侧差分把 asin(1) 的发散斜率截断成 ~743 的伪有限
+    # 值并标为可辨，反求据此给出虚假的有限预算 [0, ~1.3e-8]。修复后逐次
+    # 减半的估计序列漂移持续增大（~√2/步）且远超舍入尺度 => 判发散、422。
+    _register(client, _asin_endpoint_model("pb-asin-endpoint"))
+    r = _budget(client, "pb-asin-endpoint", "x", 1e-5)
+    assert r.status_code == 422
+    assert r.json()["error"] == "PropagationError"
+    assert "发散" in r.json()["message"]
+
+
+def test_singular_endpoint_gum_evaluation_rejected_no_partial_results(client):
+    # GUM 与反求共用同一梯度路径：同一模型的计算请求也必须 422，
+    # 且不保存任何部分结果、不占用幂等键；模型登记本身不受影响。
+    before = client.get("/api/v1/evaluations").json()["count"]
+    payload = {
+        "model_version": "pb-asin-endpoint",
+        "inputs": _asin_endpoint_model("pb-asin-endpoint")["inputs"],
+        "correlations": [],
+        "n": 2000, "seed": 7, "idempotency_key": "pb-asin-endpoint-eval-1",
+    }
+    ev = client.post("/api/v1/evaluations", json=payload)
+    assert ev.status_code == 422
+    assert ev.json()["error"] == "PropagationError"
+    assert client.get("/api/v1/evaluations").json()["count"] == before
+    assert client.get("/api/v1/idempotency/pb-asin-endpoint-eval-1").status_code == 404
+    # 模型仍在册，反求拒绝是只读的（可重复、不写记录）
+    assert client.get("/api/v1/models/pb-asin-endpoint").status_code == 200
+    assert _budget(client, "pb-asin-endpoint", "x", 1e-5).status_code == 422
+    assert client.get("/api/v1/evaluations").json()["count"] == before
+
+
+def test_singular_endpoint_sqrt_at_zero_rejected(client):
+    # sqrt(x) 在 x=0 的一阶导数 1/(2√x) 同样发散：反求与一阶传播都拒绝。
+    model = {
+        "version": "pb-sqrt-endpoint",
+        "expression": "sqrt(x)",
+        "inputs": [
+            {"name": "x", "value": 0.0, "unit": "dimensionless",
+             "standard_uncertainty": 1e-10, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+    _register(client, model)
+    r = _budget(client, "pb-sqrt-endpoint", "x", 1e-5)
+    assert r.status_code == 422
+    assert r.json()["error"] == "PropagationError"
+
+
+def test_finite_onesided_endpoint_slope_still_computed(client):
+    # sqrt(x)*sqrt(x) 在 0 处即 x（x≥0），单侧导数有限（=1）：收敛裁决
+    # 放行，反求正常给出有限区间 v(u) = u² <= t² => u ∈ [0, t]。
+    model = {
+        "version": "pb-sqrtsqrt-endpoint",
+        "expression": "sqrt(x)*sqrt(x)",
+        "inputs": [
+            {"name": "x", "value": 0.0, "unit": "dimensionless",
+             "standard_uncertainty": 1e-10, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+    _register(client, model)
+    r = _budget(client, "pb-sqrtsqrt-endpoint", "x", 1e-5)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert abs(body["sensitivity"]["coefficient"] - 1.0) < 1e-9
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is False
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True
+    assert abs(iv["upper"] - 1e-5) < 1e-15 and iv["upper_inclusive"] is True
+    # 当前 ux = 1e-10 => uc = 1e-10 ≤ 1e-5，达标
+    assert body["satisfied"] is True
+
+
+# ---------------------------------------------------------------------------
 # 只读语义：不改模型、不写计算记录；既有功能不受影响
 # ---------------------------------------------------------------------------
 

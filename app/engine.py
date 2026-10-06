@@ -305,6 +305,24 @@ _GRADIENT_STEP_FLOOR_FACTOR = 1.0
 #: 回退到漂移前的小步长。
 _GRADIENT_STABILITY = 0.5
 
+#: 端点单侧缩步研究的两个常数。
+#: _DIVERGENCE_TAIL_MIN：参与“发散”裁决的最小 h 尾部至少要有多少个
+#: 连续可辨估计（h 由大到小）；
+#: _DIVERGENCE_TAIL_GROWTH：相邻尾部估计 |g(h/2)| / |g(h)| 全部不小于
+#: 该因子才判发散。发散幂函数 f ~ (δ)^p（p∈(0,1)）的二阶单侧差分主项
+#: 为 g(h) ≈ c·h^(p−1)（sqrt 在 0：c≈0.74、每缩半增长 √2≈1.414；
+#: asin 在 1：g ~ h^(−1/2)，越接近 h_floor 增长越显著），而有限导数的
+#: 二阶单侧差分满足 g(h) = g* + O(h²)，缩步时比值恒趋 1——1.25 介于
+#: 两者之间，且只检查落到浮点可分辨下限前的尾部，先于舍入噪声裁决。
+_DIVERGENCE_TAIL_MIN = 3
+_DIVERGENCE_TAIL_GROWTH = 1.25
+
+#: 有限单侧导数的收敛确认：最小 h 的两个连续可辨估计相对差不超过该值。
+_ONESIDED_CONVERGENCE = 0.1
+
+#: 缩步研究的保护性迭代上限（正常只需 ~35 次即到达 h_floor）。
+_ONESIDED_SHRINK_MAX = 80
+
 
 def numerical_gradient_with_noise(
     compiled: CompiledExpression, x_base: Mapping[str, float], names: tuple[str, ...]
@@ -355,7 +373,12 @@ def numerical_gradient_with_noise(
     差分（截断误差仍为 O(h²)，且为域内两侧取点）。收缩到浮点可分辨
     下限 h_floor = eps·max(|x0|, 1)（再小 x0±h 已坍缩为 x0）仍有一侧
     越界，才判定名义点紧贴端点（如 sqrt(0)、asin(1)），转
-    :func:`_onesided_gradient_at_boundary` 用小步二阶单侧差分给斜率。
+    :func:`_onesided_gradient_at_boundary`：那里不只取一个固定步长，而是
+    从 h_cap 到 h_floor 的**缩步收敛研究**——按最小 h 尾部斜率的走向
+    区分有限单侧导数（如 sqrt(x)*sqrt(x) 在 0 的右导数 1）、真零
+    （0.0*sqrt(x)）与**发散导数**（sqrt 在 0、asin 在 ±1，固定步长会
+    给出 ~743 的伪有限斜率）；发散时直接抛 PropagationError，GUM 传播
+    与精度反求都必须 422 拒绝。
     收缩得到的对称步长若仍处于高曲率截断区，再减半一次：只要减半后
     仍可辨就采用更小的步长（截断随 h 单调减小），否则保留减半前步长。
     名义点本身 f(x0) 就非有限（NaN/Inf）依旧立即抛错——
@@ -426,6 +449,9 @@ def numerical_gradient_with_noise(
                 found = True
                 break
             if not found:  # 收缩到 h_floor 仍出域 => 名义点紧贴端点
+                # 端点单侧缩步研究：区分有限单侧导数与发散导数；确认发散
+                # （如 sqrt(x) 在 0、asin(x) 在 1）时直接抛 PropagationError，
+                # 绝不把 ~743 之类的固定步长单侧伪斜率标为可辨。
                 g, h, yp, ym, resolved = _onesided_gradient_at_boundary(
                     compiled, x_base, name, x0, h_cap
                 )
@@ -498,7 +524,7 @@ def _onesided_gradient_at_boundary(
     x0: float,
     h_cap: float,
 ) -> tuple[float, float, float, float, bool]:
-    """名义点紧贴定义域端点时的小步**二阶**单侧斜率估计。
+    """名义点紧贴定义域端点时的单侧斜率**缩步收敛研究**。
 
     对称探针收缩到浮点可分辨下限 h_floor 仍有一侧出域（如 sqrt(0) 的
     x−h<0、asin(1) 的 x+h>1），说明名义点本身就是端点：中心差分在浮点上
@@ -508,22 +534,52 @@ def _onesided_gradient_at_boundary(
         f1 = f(x0+s·h)，f2 = f(x0+s·2h)，s ∈ {+1, −1}
 
     （s=+1 对左端点如 sqrt/log 在 0；s=−1 对右端点如 asin/acos 在 ±1）。
-    二阶形式消去了一阶单侧差分的 O(h) 截断主项（余 O(h²)），这正是只做
-    “是否依赖”裁决的 :func:`_onesided_dependence_resolved` 不承担的角色——
-    那里明确禁止用大步一阶差分当斜率（sqrt 近 0 处 f''·h 可超过 |g|）。
-    h 从 h_cap 起逐次减半直到 x0+s·h、x0+s·2h 都在域内（端点处 h 恒有
-    域内空间，除非函数在域内紧邻处也无定义——此时名义点视为无效，抛错）。
+    二阶形式消去了一阶单侧差分的 O(h) 截断主项（余 O(h²)）。
 
-    返回 ``(g, h, f1, f2, resolved)``；可辨门槛与中心差分一致（域内单侧
-    变化量超过输出舍入尺度的 F 倍）。真零方向（如 0.0*sqrt(x) 在 0）
-    f0 == f1 == f2，g 恰为 0、不可辨。
+    **单一固定步长会把发散导数伪装成有限斜率**：asin 在 1 的真实导数为
+    +∞（1/√(1−x²)），sqrt 在 0 同理（1/(2√x)），但在 h_cap≈6e-6 的固定
+    步长上二阶单侧差分都给出 ~743 的“像样”有限值且差值远超输出舍入门槛，
+    固定步长实现因此把它标为可辨，GUM 据此给出虚假标准不确定度、反求给出
+    虚假有限预算。故不在单个步长上裁决，而是从 h_cap 起逐次减半直到
+    h_floor，在每个步长上记录 ``(g(h), resolved(h))``，按**最小 h 尾部**
+    的斜率走向区分三类（裁决在落入舍入噪声不可辨区之前完成）：
+
+    * **发散**：尾部连续 ≥ :data:`_DIVERGENCE_TAIL_MIN` 个可辨估计，且
+      缩半时 |g| 全部按 ≥ :data:`_DIVERGENCE_TAIL_GROWTH` 持续增长、符号
+      一致。发散幂函数 f ~ δ^p（0<p<1）的单侧二阶差分主项
+      g(h) ≈ c·h^(p−1)：sqrt 在 0 的缩半比恒为 √2≈1.414，asin 在 1 的
+      比值向 h_floor 增大到 1.45 以上——有限导数绝不可能产生这种走向
+      （g(h) = g* + O(h²) 缩步只会趋于平台）。确认发散时抛
+      :class:`PropagationError`：GUM 一阶线性化在该名义点无定义，传播与
+      反求都必须 422 拒绝（如 ``y = 1 + asin(x)``、``x = 1``、ux=1e-10；
+      ``sqrt(x)`` 在 x=0），而不是报虚假有限预算。
+    * **有限**：尾部两个最小 h 可辨估计相对差 ≤
+      :data:`_ONESIDED_CONVERGENCE`（O(h²) 截断随缩步趋零的平台），采用
+      最小 h 估计——``sqrt(x)*sqrt(x)`` 在 0（等于 x，右导数 1）、
+      ``sqrt(1-x*x)*sqrt(1-x*x)`` 在 1（等于 1−x²，右导数 −2）等有限
+      单侧导数正常计算；估计向零收敛的情形（如 x·√x 在 0，右导数恰为
+      0）同样接受为有限 0 斜率。
+    * **真零**：所有步长上差值恒为 0/纯舍入（如 ``0.0*sqrt(x)``、
+      ``sqrt(x)**4`` 在 0），g 恰为 0、不可辨，维持零结论。
+
+    若缩到 h_floor 尾部仍无法在上述规则间区分（既不发散也未稳定收敛），
+    按“不伪造有限灵敏度”原则同样抛错——有效有限单侧导数在浮点尺度内必
+    然收敛或可辨，落入该分支说明线性化在该名义点不可信。
+
+    返回 ``(g, h, f1, f2, resolved)``；``h`` 为最终采用步长，``f1/f2``
+    为该步长域内两点（供噪声尺度估计）。
     """
     with np.errstate(all="ignore"):
         f0 = _evaluate_scalar(compiled, x_base)
     h_floor = _EPS * max(abs(x0), 1.0)
+    F = GRADIENT_RESOLUTION_FACTOR
     for sign in (1.0, -1.0):
+        # 域内一侧从 h_cap 起逐次减半到 h_floor，记录每个步长的二阶单侧
+        # 估计与可辨性。最大步长即出域（NaN/Inf）的方向直接放弃换另一方向。
+        points: list[tuple[float, float, float, float, bool]] = []
         step = h_cap
-        while step > h_floor:
+        direction_ok = False
+        for _ in range(_ONESIDED_SHRINK_MAX):
             env1 = dict(x_base)
             env2 = dict(x_base)
             env1[name] = x0 + sign * step
@@ -533,14 +589,89 @@ def _onesided_gradient_at_boundary(
                     f1 = _evaluate_scalar(compiled, env1)
                     f2 = _evaluate_scalar(compiled, env2)
             except PropagationError:
-                step *= _GRADIENT_STEP_SHRINK
-                continue
+                if not points:
+                    direction_ok = False
+                    break  # 该方向紧邻名义点即出域：换另一方向
+                break  # 更小步长不该出域（防御式）：用已记录的点裁决
+            direction_ok = True
             g = sign * (-3.0 * f0 + 4.0 * f1 - f2) / (2.0 * step)
-            resolved = (
-                abs(f1 - f0) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(f0), abs(f1))
-                or abs(f2 - f1) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(f1), abs(f2))
+            diff_resolved = (
+                abs(f1 - f0) > F * _EPS * max(abs(f0), abs(f1))
+                or abs(f2 - f1) > F * _EPS * max(abs(f1), abs(f2))
             )
-            return g, step, f1, f2, resolved
+            # 还要越过梯度尺度的舍入下限 F·eps·max|f|/h：f0 恰为 0 时
+            # 任何微小函数差都“通过”差值门槛，但 g ~ f/h 可能只是极端
+            # 次正规尺度的舍入（如 sqrt(x)**4 在 0，g 残量 ~1e-31），
+            # 必须判为不可辨，维持真零结论（真实有限/发散斜率的 g/噪声
+            # 比恒在 1e15 量级，不受影响）。
+            grad_noise = F * _EPS * max(abs(f0), abs(f1), abs(f2)) / step
+            resolved = diff_resolved and abs(g) > grad_noise
+            points.append((step, f1, f2, g, resolved))
+            if step <= h_floor:
+                break
+            step = max(step * _GRADIENT_STEP_SHRINK, h_floor)
+        if not direction_ok or not points:
+            continue
+
+        # 裁决尾部 = 最后一个连续可辨段（按 h 从大到小）。带偏置的有限
+        # 导数（如 1 + sqrt(x)*sqrt(x) 在 0）最小几步会落入舍入噪声区，
+        # 真正的收敛平台紧贴在最后一段不可辨点之前；发散方向则全程可辨。
+        runs: list[list[tuple[float, float, float, float, bool]]] = []
+        cur: list[tuple[float, float, float, float, bool]] = []
+        for p in points:  # points 按 h 从大到小
+            if p[4]:
+                cur.append(p)
+            elif cur:
+                runs.append(cur)
+                cur = []
+        if cur:
+            runs.append(cur)
+        if not runs:
+            # 没有任何可辨段：真零方向（差值恒为 0/纯舍入）
+            h, f1, f2 = points[-1][0], points[-1][1], points[-1][2]
+            return 0.0, h, f1, f2, False
+        tail = runs[-1]
+        tail_g = [p[3] for p in tail]
+        smallest = tail[-1]
+
+        def _signed_consistent(gs: list[float]) -> bool:
+            return all(v >= 0.0 for v in gs) or all(v <= 0.0 for v in gs)
+
+        # 缩半比 r_i = |g(h/2)|/|g(h)|（0/0 视为 1：精确零估计即平台零）
+        ratios = [
+            abs(tail_g[i + 1]) / abs(tail_g[i]) if abs(tail_g[i]) > 0.0 else 1.0
+            for i in range(len(tail_g) - 1)
+        ]
+
+        # 发散：尾部至少 3 个点、符号一致，缩半时 |g| 全部按 >=1.25 持续增长
+        if (
+            len(tail) >= _DIVERGENCE_TAIL_MIN
+            and _signed_consistent(tail_g)
+            and all(r >= _DIVERGENCE_TAIL_GROWTH for r in ratios)
+        ):
+            raise PropagationError(
+                "模型在名义点处的单侧导数发散（如 sqrt 在 x=0、asin 在 x=±1），"
+                "GUM 一阶灵敏度不存在（固定步长单侧差分会给出虚假的有限斜率），"
+                "无法传播不确定度或反求精度预算"
+            )
+
+        # 有限平台：最小 h 的两个连续可辨估计相对差不超过容差
+        # （g(h) = g* + O(h²)，缩步趋同；精确零估计同样在此接受）
+        if len(tail) >= 2:
+            g_last, g_prev = abs(tail_g[-1]), abs(tail_g[-2])
+            scale = max(g_last, g_prev, _EPS)
+            if abs(tail_g[-1] - tail_g[-2]) <= _ONESIDED_CONVERGENCE * scale:
+                return smallest[3], smallest[0], smallest[1], smallest[2], True
+            # 向零单调收敛（如 x·sqrt(x) 在 0，右导数恰为 0：
+            # g(h) ∝ sqrt(h)，缩半比恒 0.707 < 1）：有限零导数
+            if ratios and all(r < 1.0 for r in ratios) and _signed_consistent(tail_g):
+                return smallest[3], smallest[0], smallest[1], smallest[2], True
+
+        # 尾部走向无法裁决（混合/噪声主导）：不伪造有限灵敏度
+        raise PropagationError(
+            "模型在名义点（定义域端点）邻域的单侧斜率在浮点可分辨尺度内"
+            "无法确认收敛，不能给出可靠的一阶灵敏度，无法传播不确定度"
+        )
     raise PropagationError(
         "模型在名义点（或其邻域）产生了非有限结果（NaN/Inf），无法传播不确定度"
     )

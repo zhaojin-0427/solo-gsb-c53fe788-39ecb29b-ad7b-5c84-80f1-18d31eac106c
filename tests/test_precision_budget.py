@@ -729,6 +729,112 @@ def test_invalid_nominal_outside_domain_still_rejected(client):
 
 
 # ---------------------------------------------------------------------------
+# 端点发散导数：asin(1) / sqrt(0) 必须拒绝，有限单侧导数仍可计算
+# ---------------------------------------------------------------------------
+
+def _endpoint_model(version, expression, value, ux=1e-10):
+    return {
+        "version": version,
+        "expression": expression,
+        "inputs": [
+            {"name": "x", "value": value, "unit": "dimensionless",
+             "standard_uncertainty": ux, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+
+
+def test_asin_exact_endpoint_divergent_budget_rejected(client):
+    # 报告场景：y = 1 + asin(x)，x=1（合法名义点，asin(1)=pi/2）、ux=1e-10。
+    # 导数 1/sqrt(1-x²) 在 x=1 发散；旧实现首个对称探针越域后转固定步长
+    # 二阶单侧差分，把 ~743 的伪斜率标为可辨，反求据此给出虚假有限预算。
+    # 缩步收敛研究识别发散后必须 422（PropagationError），且不带 interval。
+    _register(client, _endpoint_model("pb-asin-exact", "1 + asin(x)", 1.0, 1e-10))
+    r = _budget(client, "pb-asin-exact", "x", 1e-5)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "PropagationError"
+    assert "发散" in body["message"]
+    # 同样必须拒绝 acos/asin 的其余 ±1 端点
+    for version, expr in (("pb-asin-neg1", "asin(x)"), ("pb-acos-pos1", "acos(x)")):
+        _register(client, _endpoint_model(version, expr, -1.0 if "neg1" in version else 1.0))
+        assert _budget(client, version, "x", 1.0).status_code == 422
+
+
+def test_sqrt_zero_divergent_budget_and_gum_rejected_without_partial_results(client):
+    # sqrt(x) 在 x=0：真实导数 1/(2√x) 发散。一阶传播与反求都必须 422，
+    # 计算失败不留部分结果、不占用幂等键。
+    _register(client, _endpoint_model("pb-sqrt-zero", "sqrt(x)", 0.0, 1e-10))
+    r = _budget(client, "pb-sqrt-zero", "x", 1.0)
+    assert r.status_code == 422 and r.json()["error"] == "PropagationError"
+
+    ev = client.post("/api/v1/evaluations", json={
+        "model_version": "pb-sqrt-zero",
+        "inputs": _endpoint_model("pb-sqrt-zero", "sqrt(x)", 0.0, 1e-10)["inputs"],
+        "correlations": [],
+        "n": 2000, "seed": 42, "idempotency_key": "pb-sqrt-zero-eval-1",
+    })
+    assert ev.status_code == 422 and ev.json()["error"] == "PropagationError"
+    # 不留部分结果：无计算记录、幂等键未占用、模型仍在
+    assert client.get("/api/v1/evaluations?model_version=pb-sqrt-zero").json()["count"] == 0
+    assert client.get("/api/v1/idempotency/pb-sqrt-zero-eval-1").status_code == 404
+    assert client.get("/api/v1/models/pb-sqrt-zero").status_code == 200
+
+
+def test_asin_exact_endpoint_gum_rejected_and_read_only(client):
+    # 同一梯度路径也用于 GUM：asin(1) 的计算请求 422，且失败不落库；
+    # 反求只读：连续调用不新增计算记录、不改登记标准不确定度。
+    before = client.get("/api/v1/evaluations").json()["count"]
+    for _ in range(2):
+        r = _budget(client, "pb-asin-exact", "x", 1e-5)
+        assert r.status_code == 422
+    ev = client.post("/api/v1/evaluations", json={
+        "model_version": "pb-asin-exact",
+        "inputs": _endpoint_model("pb-asin-exact", "1 + asin(x)", 1.0, 1e-10)["inputs"],
+        "correlations": [],
+        "n": 2000, "seed": 20261006, "idempotency_key": "pb-asin-exact-eval-1",
+    })
+    assert ev.status_code == 422 and ev.json()["error"] == "PropagationError"
+    after = client.get("/api/v1/evaluations").json()["count"]
+    assert after == before
+    assert client.get("/api/v1/idempotency/pb-asin-exact-eval-1").status_code == 404
+    ins = client.get("/api/v1/models/pb-asin-exact").json()["inputs"][0]
+    assert ins["standard_uncertainty"] == 1e-10
+
+
+def test_sqrt_product_zero_finite_onesided_derivative_budget_ok(client):
+    # sqrt(x)*sqrt(x)（=x，求值域内）在 0 的右导数为有限值 1：尽管 sqrt
+    # 单独在 0 发散，乘积消去奇性，GUM 反求必须正常给有限区间
+    # ux ∈ [0, 2e-6]（目标 2e-6），不得按发散拒绝。
+    _register(client, _endpoint_model("pb-sqrt2-zero", "sqrt(x)*sqrt(x)", 0.0, 1e-6))
+    r = _budget(client, "pb-sqrt2-zero", "x", 2e-6)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert abs(body["sensitivity"]["coefficient"] - 1.0) < 0.02
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is False
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True
+    assert abs(iv["upper"] - 2e-6) / 2e-6 < 0.02
+
+    # 带输出偏置的同一结构（最小缩步被偏置舍入淹没）：仍判有限
+    _register(client, _endpoint_model("pb-sqrt2-bias", "1.0 + sqrt(x)*sqrt(x)", 0.0, 1e-6))
+    r = _budget(client, "pb-sqrt2-bias", "x", 2e-6)
+    assert r.status_code == 200, r.text
+    assert abs(r.json()["sensitivity"]["coefficient"] - 1.0) < 0.02
+
+
+def test_endpoint_true_zero_slope_still_unbounded(client):
+    # 端点真零斜率（0.0*asin(x) 在 1）：缩步研究差值恒零，仍判零、无上限。
+    _register(client, _endpoint_model("pb-asin-flat", "0.0*asin(x)", 1.0, 1.0))
+    body = _budget(client, "pb-asin-flat", "x", 1e-3).json()
+    assert body["sensitivity"]["coefficient"] == 0.0
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is True
+    assert iv["upper"] is None
+
+
+# ---------------------------------------------------------------------------
 # 只读语义：不改模型、不写计算记录；既有功能不受影响
 # ---------------------------------------------------------------------------
 

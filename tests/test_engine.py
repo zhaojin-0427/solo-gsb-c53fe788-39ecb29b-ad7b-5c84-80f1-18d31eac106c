@@ -416,28 +416,85 @@ def test_gradient_initial_probe_beyond_domain_shrinks_symmetric_step():
         pass
 
 
-def test_gradient_exact_endpoint_uses_small_step_onesided_estimate():
-    # 名义点恰在定义域端点（中心差分在浮点上无法取点）：小步二阶单侧差分
-    # 给有限、正（或对 acos 为负）的斜率，不再直接抛错；真零方向仍判零。
+def test_gradient_exact_endpoint_divergent_derivative_is_rejected():
+    # 名义点恰在定义域端点且单侧导数发散（sqrt 在 0：1/(2√x)→∞；
+    # asin/acos 在 ±1：1/√(1−x²)→∞）：固定步长二阶单侧差分会给出 ~743
+    # 之类“像样”的有限伪斜率且差值远超输出舍入门槛——缩步收敛研究必须
+    # 在落入舍入噪声前识别“缩步时 |g| 持续发散增长”的尾部并抛错，绝不
+    # 把发散导数标为可辨（否则 GUM 给出虚假标准不确定度、反求给出虚假
+    # 有限预算）。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+    from app.errors import PropagationError
+
+    for src, x0 in (
+        ("sqrt(x)", 0.0),
+        ("x**0.5", 0.0),
+        ("asin(x)", 1.0),
+        ("asin(x)", -1.0),
+        ("acos(x)", 1.0),
+        ("acos(x)", -1.0),
+        ("1 + asin(x)", 1.0),
+    ):
+        expr = compile_expression(src, ("x",))
+        try:
+            numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
+            assert False, f"{src} @ {x0} 导数发散，必须拒绝"
+        except PropagationError:
+            pass
+
+    # 报告中的登记组合：y = 1 + asin(x)，x = 1、ux = 1e-10
+    expr = compile_expression("1 + asin(x)", ("x",))
+    try:
+        numerical_gradient_with_noise(expr, {"x": 1.0}, ("x",))
+        assert False, "asin(1) 必须拒绝（旧实现给出 ~743 的虚假有限斜率）"
+    except PropagationError:
+        pass
+
+
+def test_gradient_exact_endpoint_finite_onesided_derivative_computed():
+    # 端点处的**有限**单侧导数仍可计算：缩步研究在最小 h 尾部看到稳定
+    # 收敛平台即采用最小 h 估计。
     from app.expressions import compile_expression
     from app.engine import numerical_gradient_with_noise
 
-    for src, x0, positive in (
-        ("sqrt(x)", 0.0, True),
-        ("asin(x)", 1.0, True),
-        ("asin(x)", -1.0, True),
-        ("acos(x)", 1.0, False),
+    # sqrt(x)*sqrt(x) = x（求值域内），在 0 的右导数为有限值 1，
+    # 尽管 sqrt 单独在 0 发散——乘积消去了奇性。
+    for src in ("sqrt(x)*sqrt(x)", "sqrt(x)**2", "x**0.5*x**0.5"):
+        expr = compile_expression(src, ("x",))
+        g, _, resolved = numerical_gradient_with_noise(expr, {"x": 0.0}, ("x",))
+        assert math.isfinite(g[0]), src
+        assert abs(float(g[0]) - 1.0) < 0.02, (src, g[0])
+        assert bool(resolved[0]) is True
+
+    # 带输出偏置的同一结构（1 + …）：最小几步被偏置舍入淹没，
+    # 收敛平台在最后一段不可辨点之前，仍必须正确识别为有限 1。
+    expr = compile_expression("1.0 + sqrt(x)*sqrt(x)", ("x",))
+    g, _, resolved = numerical_gradient_with_noise(expr, {"x": 0.0}, ("x",))
+    assert abs(float(g[0]) - 1.0) < 0.02 and bool(resolved[0]) is True
+
+    # x·sqrt(x) 在 0 的右导数恰为 0（g(h) ∝ √h 向零单调收敛）：
+    # 接受为有限零导数，既不按发散拒绝，也不与“差值恒零”的真零混淆。
+    expr = compile_expression("sqrt(x)*x", ("x",))
+    g, _, resolved = numerical_gradient_with_noise(expr, {"x": 0.0}, ("x",))
+    assert math.isfinite(g[0]) and abs(float(g[0])) < 1e-6 and bool(resolved[0]) is True
+
+
+def test_gradient_exact_endpoint_true_zero_slope_stays_zero():
+    # 端点处的真零斜率：所有缩步上差值恒为 0（或仅次正规舍入残量，低于
+    # 梯度尺度噪声下限），g=0、不可辨，维持零结论（反求→无上限）。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    for src, x0 in (
+        ("0.0*sqrt(x)", 0.0),
+        ("1.0 + 0.0*sqrt(x)", 0.0),
+        ("0.0*asin(x)", 1.0),
+        ("sqrt(x)**4", 0.0),
     ):
         expr = compile_expression(src, ("x",))
         g, _, resolved = numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
-        assert math.isfinite(g[0]), (src, x0)
-        assert (float(g[0]) > 0.0) == positive, (src, x0, g[0])
-        assert bool(resolved[0]) is True
-
-    # 端点处的真零斜率（0.0*sqrt(x) 在 x=0）：二阶单侧差分恒为 0、不可辨
-    expr = compile_expression("1.0 + 0.0*sqrt(x)", ("x",))
-    g, _, resolved = numerical_gradient_with_noise(expr, {"x": 0.0}, ("x",))
-    assert g[0] == 0.0 and bool(resolved[0]) is False
+        assert g[0] == 0.0 and bool(resolved[0]) is False, (src, x0, g[0])
 
 
 def test_gradient_domain_boundary_true_zero_stays_zero():
